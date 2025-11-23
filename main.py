@@ -11,6 +11,9 @@ import onnxruntime as ort
 from rapidocr_onnxruntime import RapidOCR
 import os
 from openai import OpenAI
+from dual_pdf import build_dual_pdf, build_dual_pdf_page
+from PIL import Image
+import io
 
 app = FastAPI()
 
@@ -50,13 +53,23 @@ class TranslateLayoutReq(BaseModel):
     direction: str
     layout: dict
 
+class ExportDualPdfReq(BaseModel):
+    file_id: str
+    direction: str
+
+class ExportSinglePagePdfReq(BaseModel):
+    file_id: str
+    page: int
+    direction: str
+    layout: dict
+
 # DocLayout-YOLO wrapper
 class DocLayoutYolo:
     def __init__(self, model_path):
         self.session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
         self.img_size = 1024
         # detection score threshold (can lower if missing boxes)
-        self.score_thresh = 0.25
+        self.score_thresh = 0.1 # 原为 0.25，调低以检测更多区块
         self.id2label = {
             0: "text", 1: "title", 2: "figure", 3: "table", 4: "caption",
             5: "header", 6: "footer", 7: "reference", 8: "equation"
@@ -143,7 +156,133 @@ def merge_ocr_lines(ocr_result):
         merged.append(" ".join([w["text"] for w in ln]))
     return merged
 
-# 后端接口
+
+# ===================================================================
+#  Core Logic Implementation (refactored for reuse)
+# ===================================================================
+
+def _get_page_layout_impl(pdf_path_str: str, page_num: int):
+    """
+    Extracts layout and text from a single PDF page.
+    """
+    doc = fitz.open(pdf_path_str)
+    if page_num < 1 or page_num > len(doc):
+        raise ValueError("Page number out of range")
+
+    page = doc[page_num - 1]
+    pix = page.get_pixmap(dpi=200)
+    img_bytes = pix.tobytes("png")
+    img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+
+    layout_model = DocLayoutYolo(MODEL_PATH)
+    ocr = RapidOCR()
+
+    boxes = layout_model.detect(img)
+    print(f"[_get_page_layout_impl] raw detections: {len(boxes)}")
+
+    valid_labels = {"text", "title", "caption", "reference", "header", "footer", "figure", "table"}
+    regions = [b for b in boxes if b.get("label") in valid_labels]
+    print(f"[_get_page_layout_impl] filtered regions: {len(regions)}")
+
+    blocks = []
+    for rid, reg in enumerate(regions):
+        x1, y1, x2, y2 = reg["bbox"]
+        h, w = img.shape[:2]
+        x1 = max(0, min(w - 1, int(x1)))
+        x2 = max(0, min(w, int(x2)))
+        y1 = max(0, min(h - 1, int(y1)))
+        y2 = max(0, min(h, int(y2)))
+
+        if x2 <= x1 or y2 <= y1:
+            print(f"[_get_page_layout_impl] skip invalid bbox: {reg['bbox']}")
+            continue
+
+        crop = img[y1:y2, x1:x2]
+        try:
+            ocr_result, _ = ocr(crop)
+            lines = merge_ocr_lines(ocr_result)
+            block_text = "\n".join(lines)
+        except Exception as e:
+            print(f"[_get_page_layout_impl] OCR failed for region {rid}: {e}")
+            block_text = ""
+
+        blocks.append({
+            "id": rid,
+            "category": reg.get("label", "unknown"),
+            "bbox": [x1, y1, x2, y2],
+            "text": block_text
+        })
+
+    if len(blocks) == 0:
+        print("[_get_page_layout_impl] no blocks found, running full-page OCR fallback")
+        try:
+            ocr_result, _ = ocr(img)
+            lines = merge_ocr_lines(ocr_result)
+            full_text = "\n".join(lines)
+        except Exception as e:
+            print(f"[_get_page_layout_impl] full-page OCR failed: {e}")
+            full_text = ""
+        blocks.append({
+            "id": 0,
+            "category": "ocr_full",
+            "bbox": [0, 0, img.shape[1], img.shape[0]],
+            "text": full_text
+        })
+
+    return {
+        "width": img.shape[1],
+        "height": img.shape[0],
+        "blocks": blocks
+    }
+
+
+def _translate_layout_impl(layout: dict, direction: str):
+    """
+    Translates the text in a layout dictionary.
+    """
+    api_key = os.environ.get("OPENAI_API_KEY")
+    base_url = os.environ.get("OPENAI_BASE_URL")
+    client_kwargs = {}
+    if base_url:
+        client_kwargs["base_url"] = base_url
+    
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY environment variable not set.")
+
+    client = OpenAI(api_key=api_key, **client_kwargs)
+
+    if direction == "en2zh":
+        system_prompt = "你是一个专业的英→中科技论文翻译助手。要求：忠实原文，术语准确，风格正式。"
+    else:
+        system_prompt = "You are a professional assistant for translating Chinese scientific papers to English. Be accurate, formal, and keep technical terms."
+
+    for blk in layout.get("blocks", []):
+        src = blk.get("text", "")
+        if not src.strip():
+            blk["text_translated"] = ""
+            continue
+        
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": src},
+                ],
+                temperature=0.1,
+            )
+            blk["text_translated"] = resp.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"[_translate_layout_impl] OpenAI API call failed: {e}")
+            blk["text_translated"] = f"Error: Translation failed. {e}"
+
+    return layout
+
+
+# ===================================================================
+#  API Endpoints
+# ===================================================================
+
 @app.get("/api/ping")
 def ping():
     return {"ok": True, "msg": "backend alive"}
@@ -171,96 +310,97 @@ async def page_layout(req: PageLayoutReq):
     pdf_path = PDF_DIR / f"{req.file_id}.pdf"
     if not pdf_path.exists():
         raise HTTPException(status_code=404, detail="PDF 文件不存在")
-    doc = fitz.open(str(pdf_path))
-    if req.page < 1 or req.page > len(doc):
-        raise HTTPException(status_code=400, detail="页码超出范围")
-    page = doc[req.page - 1]
-    pix = page.get_pixmap(dpi=200)
-    img_bytes = pix.tobytes("png")
-    img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
-    layout = DocLayoutYolo(MODEL_PATH)
-    ocr = RapidOCR()
-    boxes = layout.detect(img)
-    # debug info: print number of raw detections
-    print(f"[page_layout] raw detections: {len(boxes)}")
-    # broaden accepted labels (DocLayout label set may vary)
-    valid_labels = {"text", "title", "caption", "reference", "header", "footer", "figure", "table"}
-    regions = [b for b in boxes if b.get("label") in valid_labels]
-    print(f"[page_layout] filtered regions: {len(regions)}")
-    blocks = []
-    for rid, reg in enumerate(regions):
-        x1, y1, x2, y2 = reg["bbox"]
-        # clip bbox to image bounds
-        h, w = img.shape[:2]
-        x1 = max(0, min(w - 1, int(x1)))
-        x2 = max(0, min(w, int(x2)))
-        y1 = max(0, min(h - 1, int(y1)))
-        y2 = max(0, min(h, int(y2)))
-        if x2 <= x1 or y2 <= y1:
-            print(f"[page_layout] skip invalid bbox: {reg['bbox']}")
-            continue
-        crop = img[y1:y2, x1:x2]
-        try:
-            ocr_result, _ = ocr(crop)
-            lines = merge_ocr_lines(ocr_result)
-            block_text = "\n".join(lines)
-        except Exception as e:
-            print(f"[page_layout] OCR failed for region {rid}: {e}")
-            block_text = ""
-        blocks.append({
-            "id": rid,
-            "category": reg.get("label", "unknown"),
-            "bbox": [x1, y1, x2, y2],
-            "text": block_text
-        })
-    # Fallback: if no regions found, return whole-page OCR as a single block
-    if len(blocks) == 0:
-        print("[page_layout] no blocks found, running full-page OCR fallback")
-        try:
-            ocr_result, _ = ocr(img)
-            lines = merge_ocr_lines(ocr_result)
-            full_text = "\n".join(lines)
-        except Exception as e:
-            print(f"[page_layout] full-page OCR failed: {e}")
-            full_text = ""
-        blocks.append({
-            "id": 0,
-            "category": "ocr_full",
-            "bbox": [0, 0, img.shape[1], img.shape[0]],
-            "text": full_text
-        })
-    return {
-        "width": img.shape[1],
-        "height": img.shape[0],
-        "blocks": blocks
-    }
+    
+    try:
+        layout_data = _get_page_layout_impl(str(pdf_path), req.page)
+        return layout_data
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"[API /api/page_layout] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+
 
 @app.post("/api/translate_layout")
 async def translate_layout(req: TranslateLayoutReq):
-    direction = req.direction
-    layout = req.layout
-    api_key = os.environ.get("OPENAI_API_KEY")
-    base_url = os.environ.get("OPENAI_BASE_URL")
-    client_kwargs = {}
-    if base_url:
-        client_kwargs["base_url"] = base_url
-    client = OpenAI(api_key=api_key, **client_kwargs)
-    if direction == "en2zh":
-        system_prompt = "你是一个专业的英→中科技论文翻译助手。要求：忠实原文，术语准确，风格正式。"
-    else:
-        system_prompt = "You are a professional assistant for translating Chinese scientific papers to English. Be accurate, formal, and keep technical terms."
-    for blk in layout.get("blocks", []):
-        src = blk.get("text", "")
-        if not src.strip():
-            blk["text_translated"] = ""
-            continue
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": src},
-            ],
-            temperature=0.1,
+    try:
+        translated_layout = _translate_layout_impl(req.layout, req.direction)
+        return translated_layout
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"[API /api/translate_layout] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+
+
+@app.post("/api/export_dual_pdf")
+async def export_dual_pdf(req: ExportDualPdfReq):
+    pdf_path = PDF_DIR / f"{req.file_id}.pdf"
+    if not pdf_path.exists():
+        raise HTTPException(status_code=404, detail="原始 PDF 文件不存在")
+
+    output_filename = f"{req.file_id}_dual.pdf"
+    output_path = PDF_DIR / output_filename
+    
+    try:
+        build_dual_pdf(
+            pdf_path_str=str(pdf_path),
+            get_layout_func=_get_page_layout_impl,
+            translate_func=_translate_layout_impl,
+            direction=req.direction,
+            output_pdf_path=str(output_path)
         )
-        blk["text_translated"] = resp.choices[0].message.content.strip()
-    return layout
+        return {
+            "ok": True,
+            "file_id": req.file_id,
+            "dual_pdf_url": f"/pdfs/{output_filename}"
+        }
+    except Exception as e:
+        print(f"[API /api/export_dual_pdf] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"创建双语PDF失败: {e}")
+
+
+@app.post("/api/export_single_page_pdf")
+async def export_single_page_pdf(req: ExportSinglePagePdfReq):
+    """
+    Generates a dual-language PDF for a single page using provided layout data.
+    """
+    pdf_path = PDF_DIR / f"{req.file_id}.pdf"
+    if not pdf_path.exists():
+        raise HTTPException(status_code=404, detail="原始 PDF 文件不存在")
+
+    output_filename = f"{req.file_id}_page_{req.page}_dual.pdf"
+    output_path = PDF_DIR / output_filename
+
+    try:
+        # 1. Get the original page as an image
+        doc = fitz.open(str(pdf_path))
+        if not (1 <= req.page <= len(doc)):
+            raise HTTPException(status_code=400, detail="页码超出范围")
+        page = doc[req.page - 1]
+        pix = page.get_pixmap(dpi=200)
+        original_img = Image.open(io.BytesIO(pix.tobytes()))
+
+        # 2. Ensure the layout is translated
+        # Check if the first block has translation, if not, translate the whole layout.
+        layout = req.layout
+        has_translation = all("text_translated" in block for block in layout.get("blocks", []))
+        
+        if not has_translation:
+            print("[API /api/export_single_page_pdf] Layout not translated, translating now...")
+            layout = _translate_layout_impl(layout, req.direction)
+
+        # 3. Build the side-by-side page image
+        combined_img = build_dual_pdf_page(original_img, layout, req.direction)
+
+        # 4. Save the single image as a PDF
+        combined_img.save(str(output_path), "PDF", resolution=100.0)
+        
+        return {
+            "ok": True,
+            "file_id": req.file_id,
+            "dual_pdf_url": f"/pdfs/{output_filename}"
+        }
+    except Exception as e:
+        print(f"[API /api/export_single_page_pdf] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"创建单页双语PDF失败: {e}")

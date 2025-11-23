@@ -1,0 +1,13 @@
+fastapi>=0.95
+uvicorn[standard]>=0.22
+pydantic>=1.10
+onnxruntime>=1.15
+rapidocr-onnxruntime>=0.0.6
+pymupdf>=1.22
+Pillow>=10.0
+opencv-python>=4.7
+pytesseract>=0.3
+python-multipart>=0.0.6
+openai>=1.0
+numpy>=1.24
+requests>=2.28
