@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Pip and build
+pip-wheel-metadata/
+build/
+dist/
+eggs/
+*.egg-info/
+
+# Editor/IDE
+.vscode/
+*.sublime-workspace
+*.sublime-project
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python caches
+.mypy_cache/
+.pytest_cache/
+
+# Local config
+*.local
+
+# Ignore large models and caches by default (uncomment if you want to commit models)
+models/*.onnx
+models/.cache/
+
+# PDFs and other large documents (skip uploading by default)
+pdfs/*.pdf
+
+# RapidOCR / downloaded model cache
+.cache/
+
+# Ignore Tesseract temp if any
+tessdata/

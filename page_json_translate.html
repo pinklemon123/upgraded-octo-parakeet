@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>PDF 单页 JSON 翻译工具</title>
+  <link rel="stylesheet" href="page_json_translate.css">
+</head>
+<body>
+  <header>
+    <h1>PDF 单页 JSON 翻译工具</h1>
+
+    <div class="toolbar-group">
+      <label style="font-size:13px; display:flex; align-items:center; gap:8px;">
+        <input type="file" id="pdfFileInput" accept="application/pdf">
+        <button id="uploadBtn" class="btn">上传并打开</button>
+      </label>
+
+      <label style="font-size:13px; color:var(--muted);">
+        页码：
+        <select id="pageSelect" disabled style="margin-left:6px;background:transparent;border:none;color:var(--muted);"></select>
+      </label>
+
+      <div class="direction-group" style="color:var(--muted);">
+        方向：
+        <label style="margin-left:8px;font-size:13px;color:var(--muted);">
+          <input type="radio" name="direction" value="en2zh" checked>
+          英 → 中
+        </label>
+        <label style="margin-left:6px;font-size:13px;color:var(--muted);">
+          <input type="radio" name="direction" value="zh2en">
+          中 → 英
+        </label>
+      </div>
+
+      <button id="layoutBtn" class="btn primary" disabled>生成此页 JSON</button>
+      <button id="translateBtn" class="btn secondary" disabled>用 AI 翻译 JSON</button>
+
+      <button id="pingBtn" class="btn">测试后端</button>
+      <span id="backendStatus" class="backend-status backend-bad">未连接</span>
+    </div>
+
+    <div class="status" id="statusText" style="margin-left:12px;color:var(--muted);">步骤：启动后端 → 上传 PDF → 选页 → 生成 JSON → 翻译</div>
+  </header>
+  <main>
+    <!-- 左边：原始 PDF 预览 -->
+    <div class="col">
+      <section class="panel" style="flex:1;">
+        <div class="panel-header">
+          <span>原始 PDF 预览</span>
+          <span id="pageInfo" style="font-size:12px;color:var(--muted);"></span>
+        </div>
+        <iframe id="pdfViewer" class="pdf-frame"></iframe>
+      </section>
+    </div>
+    <!-- 右边：布局可视化 + JSON -->
+    <div class="col">
+      <section class="panel" style="flex: 1.3;">
+        <div class="panel-header">
+          <span>块布局可视化</span>
+          <span class="small-hint">左：原始布局；右：翻译后布局（如果已翻译）</span>
+        </div>
+        <div style="display:flex; gap:8px; flex:1; min-height:0;">
+          <div class="layout-view">
+            <div id="layoutOriginal" class="layout-inner"></div>
+          </div>
+          <div class="layout-view">
+            <div id="layoutTranslated" class="layout-inner"></div>
+          </div>
+        </div>
+      </section>
+      <section class="panel" style="flex:1;">
+        <div class="panel-header">
+          <span>当前页 JSON</span>
+          <span class="small-hint">可以手动编辑后再点“用 AI 翻译 JSON”</span>
+        </div>
+        <textarea id="jsonBox" placeholder='还没有 JSON，先点“生成此页 JSON”'></textarea>
+      </section>
+    </div>
+  </main>
+  <script>
+    // ======== 配置你的后端地址 ========
+    const BASE_URL = 'http://127.0.0.1:8000';
+
+    const pdfFileInput = document.getElementById('pdfFileInput');
+    const pageSelect = document.getElementById('pageSelect');
+    const layoutBtn = document.getElementById('layoutBtn');
+    const translateBtn = document.getElementById('translateBtn');
+    const statusText = document.getElementById('statusText');
+    const pdfViewer = document.getElementById('pdfViewer');
+    const pageInfo = document.getElementById('pageInfo');
+    const pingBtn = document.getElementById('pingBtn');
+    const backendStatus = document.getElementById('backendStatus');
+    const jsonBox = document.getElementById('jsonBox');
+    const layoutOriginal = document.getElementById('layoutOriginal');
+    const layoutTranslated = document.getElementById('layoutTranslated');
+
+    let currentFileId = null;
+    let totalPages = 0;
+
+    function setStatus(text) { statusText.textContent = text; }
+
+    function getDirection() { const checked = document.querySelector('input[name="direction"]:checked'); return checked ? checked.value : 'en2zh'; }
+
+    async function pingBackend(showToast = false) {
+      try {
+        const resp = await fetch(`${BASE_URL}/api/ping`);
+        if (!resp.ok) throw new Error('状态码 ' + resp.status);
+        const data = await resp.json();
+        if (!data.ok) throw new Error('返回 ok=false');
+        backendStatus.textContent = '已连接';
+        backendStatus.classList.remove('backend-bad');
+        backendStatus.classList.add('backend-ok');
+        if (showToast) setStatus('后端连接正常。');
+        return true;
+      } catch (err) {
+        console.error(err);
+        backendStatus.textContent = '未连接';
+        backendStatus.classList.remove('backend-ok');
+        backendStatus.classList.add('backend-bad');
+        if (showToast) setStatus('无法连接后端，请确认已运行后端启动器。');
+        return false;
+      }
+    }
+
+    window.addEventListener('load', () => { pingBackend(false); });
+    pingBtn.addEventListener('click', () => { pingBackend(true); });
+
+    // 上传按钮行为：触发文件输入
+    const uploadBtn = document.getElementById('uploadBtn');
+    uploadBtn.addEventListener('click', (e) => { e.preventDefault(); pdfFileInput.click(); });
+
+    // 支持拖放 PDF 到页面任意位置
+    window.addEventListener('dragover', (e) => { e.preventDefault(); });
+    window.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+        const f = e.dataTransfer.files[0];
+        if (f.type === 'application/pdf') {
+          pdfFileInput.files = e.dataTransfer.files;
+          const evt = new Event('change');
+          pdfFileInput.dispatchEvent(evt);
+        }
+      }
+    });
+
+    // 上传 PDF
+    pdfFileInput.addEventListener('change', async () => {
+      const file = pdfFileInput.files[0];
+      if (!file) return;
+      const ok = await pingBackend(false);
+      if (!ok) { setStatus('后端未连接，请先启动后端再上传 PDF。'); return; }
+      setStatus('正在上传 PDF...');
+      jsonBox.value = '';
+      layoutOriginal.innerHTML = '';
+      layoutTranslated.innerHTML = '';
+      pageSelect.innerHTML = '';
+      pageSelect.disabled = true;
+      layoutBtn.disabled = true;
+      translateBtn.disabled = true;
+      currentFileId = null;
+      totalPages = 0;
+      pageInfo.textContent = '';
+      try {
+        const fd = new FormData();
+        fd.append('file', file);
+        const resp = await fetch(`${BASE_URL}/api/upload_pdf`, { method: 'POST', body: fd });
+        if (!resp.ok) throw new Error('上传失败 ' + resp.status);
+        const data = await resp.json();
+        currentFileId = data.file_id;
+        totalPages = data.total_pages || 1;
+        if (data.pdf_url) { pdfViewer.src = `${BASE_URL}${data.pdf_url}`; } else { const url = URL.createObjectURL(file); pdfViewer.src = url; }
+        for (let i = 1; i <= totalPages; i++) { const opt = document.createElement('option'); opt.value = i; opt.textContent = `第 ${i} 页`; pageSelect.appendChild(opt); }
+        pageSelect.disabled = false; layoutBtn.disabled = false; pageInfo.textContent = `总页数：${totalPages}，当前第 1 页`;
+        setStatus('PDF 上传完成，选择页码后可以生成此页 JSON。');
+      } catch (err) { console.error(err); setStatus('上传或解析 PDF 失败，请检查 /api/upload_pdf 日志。'); }
+    });
+
+    pageSelect.addEventListener('change', () => {
+      const page = pageSelect.value;
+      pageInfo.textContent = `总页数：${totalPages}，当前第 ${page} 页`;
+      jsonBox.value = '';
+      layoutOriginal.innerHTML = '';
+      layoutTranslated.innerHTML = '';
+      translateBtn.disabled = true;
+    });
+
+    // 根据 layout 在指定容器里画方块
+    function renderLayout(layout, container, translated = false) {
+      container.innerHTML = '';
+      if (!layout || !layout.blocks || layout.blocks.length === 0) {
+        const tip = document.createElement('div');
+        tip.style.padding = '8px';
+        tip.style.fontSize = '12px';
+        tip.style.color = '#94a3b8';
+        tip.textContent = '暂无块数据';
+        container.appendChild(tip);
+        return;
+      }
+      const pageW = layout.width || 1000;
+      const pageH = layout.height || 1414;
+      container.style.aspectRatio = `${pageW}/${pageH}`;
+      layout.blocks.forEach(block => {
+        const [x1, y1, x2, y2] = block.bbox;
+        const div = document.createElement('div');
+        div.className = 'block' + (translated ? ' translated' : '');
+        const left = (x1 / pageW) * 100;
+        const top = (y1 / pageH) * 100;
+        const width = ((x2 - x1) / pageW) * 100;
+        const height = ((y2 - y1) / pageH) * 100;
+        div.style.left = left + '%';
+        div.style.top = top + '%';
+        div.style.width = width + '%';
+        div.style.height = height + '%';
+        const label = document.createElement('span');
+        label.className = 'block-label';
+        label.textContent = `${block.id ?? ''} ${block.category ?? ''}`.trim();
+        const textSpan = document.createElement('span');
+        textSpan.className = 'block-text';
+        const t = translated ? (block.text_translated ?? block.text ?? '') : (block.text ?? '');
+        textSpan.textContent = t.length > 40 ? t.slice(0, 40) + '…' : t;
+        div.appendChild(label);
+        div.appendChild(textSpan);
+        container.appendChild(div);
+      });
+    }
+
+    // 生成此页 JSON
+    layoutBtn.addEventListener('click', async () => {
+      if (!currentFileId) return;
+      const page = Number(pageSelect.value || 1);
+      setStatus(`正在生成第 ${page} 页的布局 JSON...`);
+      layoutBtn.disabled = true; translateBtn.disabled = true; layoutOriginal.innerHTML = ''; layoutTranslated.innerHTML = ''; jsonBox.value = '';
+      try {
+        const resp = await fetch(`${BASE_URL}/api/page_layout`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ file_id: currentFileId, page: page }) });
+        if (!resp.ok) throw new Error('请求失败 ' + resp.status);
+        const data = await resp.json();
+        jsonBox.value = JSON.stringify(data, null, 2);
+        renderLayout(data, layoutOriginal, false);
+        setStatus(`第 ${page} 页布局 JSON 已生成，可编辑后再翻译。`);
+        translateBtn.disabled = false;
+      } catch (err) { console.error(err); setStatus('生成布局 JSON 时出错，请检查 /api/page_layout 日志。'); } finally { layoutBtn.disabled = false; }
+    });
+
+    // 用 AI 翻译 JSON
+    translateBtn.addEventListener('click', async () => {
+      let layoutObj;
+      try { layoutObj = JSON.parse(jsonBox.value); } catch (err) { setStatus('JSON 解析失败，请检查格式是否正确。'); return; }
+      const direction = getDirection();
+      const page = Number(pageSelect.value || 1);
+      setStatus(`正在用 AI 翻译第 ${page} 页 JSON（${direction === 'en2zh' ? '英→中' : '中→英'}）...`);
+      translateBtn.disabled = true;
+      try {
+        const resp = await fetch(`${BASE_URL}/api/translate_layout`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ direction: direction, layout: layoutObj }) });
+        if (!resp.ok) throw new Error('请求失败 ' + resp.status);
+        const data = await resp.json();
+        jsonBox.value = JSON.stringify(data, null, 2);
+        renderLayout(layoutObj, layoutOriginal, false);
+        renderLayout(data, layoutTranslated, true);
+        setStatus(`第 ${page} 页 JSON 翻译完成。左为原文，右为译文布局。`);
+      } catch (err) { console.error(err); setStatus('翻译 JSON 时出错，请检查 /api/translate_layout 日志。'); } finally { translateBtn.disabled = false; }
+    });
+  </script>
+</body>
+</html>
