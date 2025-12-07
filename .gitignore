@@ -1,5 +1,48 @@
 # Python
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+venv/
+
+# Node / web static builds (if any)
+dist/
+build/
+
+# VS Code
+.vscode/
+
+# Logs and temp
+*.log
+*.tmp
+*.temp
+.tmp/
+
+# Data / Outputs
+pdfs/
+outputs/
+cache/
+
+# Models / large assets
+*.onnx
+*.pt
+*.ckpt
+models/
+assets/fonts/*.ttc
+assets/fonts/*.ttf
+
+# Generated images and HTML intermediates
+*.png
+*.jpg
+*.jpeg
+*.html
+
+# OS files
+Thumbs.db
+.DS_Store# Python
+__pycache__/
 *.py[cod]
 *.pyo
 *.pyd
