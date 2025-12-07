@@ -34,6 +34,8 @@
 
       <button id="layoutBtn" class="btn primary" disabled>生成此页 JSON</button>
       <button id="translateBtn" class="btn secondary" disabled>用 AI 翻译 JSON</button>
+      <button id="exportPdfBtn" class="btn success" disabled>生成对照 PDF (全部)</button>
+      <button id="exportSinglePagePdfBtn" class="btn success" disabled>生成对照 PDF (当前页)</button>
 
       <button id="pingBtn" class="btn">测试后端</button>
       <span id="backendStatus" class="backend-status backend-bad">未连接</span>
@@ -85,6 +87,8 @@
     const pageSelect = document.getElementById('pageSelect');
     const layoutBtn = document.getElementById('layoutBtn');
     const translateBtn = document.getElementById('translateBtn');
+    const exportPdfBtn = document.getElementById('exportPdfBtn');
+    const exportSinglePagePdfBtn = document.getElementById('exportSinglePagePdfBtn');
     const statusText = document.getElementById('statusText');
     const pdfViewer = document.getElementById('pdfViewer');
     const pageInfo = document.getElementById('pageInfo');
@@ -157,6 +161,8 @@
       pageSelect.disabled = true;
       layoutBtn.disabled = true;
       translateBtn.disabled = true;
+      exportPdfBtn.disabled = true;
+      exportSinglePagePdfBtn.disabled = true;
       currentFileId = null;
       totalPages = 0;
       pageInfo.textContent = '';
@@ -172,6 +178,7 @@
         for (let i = 1; i <= totalPages; i++) { const opt = document.createElement('option'); opt.value = i; opt.textContent = `第 ${i} 页`; pageSelect.appendChild(opt); }
         pageSelect.disabled = false; layoutBtn.disabled = false; pageInfo.textContent = `总页数：${totalPages}，当前第 1 页`;
         setStatus('PDF 上传完成，选择页码后可以生成此页 JSON。');
+        exportPdfBtn.disabled = false; // Enable export after upload
       } catch (err) { console.error(err); setStatus('上传或解析 PDF 失败，请检查 /api/upload_pdf 日志。'); }
     });
 
@@ -182,6 +189,111 @@
       layoutOriginal.innerHTML = '';
       layoutTranslated.innerHTML = '';
       translateBtn.disabled = true;
+      exportSinglePagePdfBtn.disabled = true;
+    });
+
+    // 生成对照 PDF (全部页面)
+    exportPdfBtn.addEventListener('click', async () => {
+      if (!currentFileId) {
+        setStatus('请先上传一个 PDF 文件。');
+        return;
+      }
+      const direction = getDirection();
+      setStatus(`正在生成对照 PDF（${direction === 'en2zh' ? '英→中' : '中→英'}），所有页面将依次处理，请耐心等待...`);
+      exportPdfBtn.disabled = true;
+      layoutBtn.disabled = true;
+      translateBtn.disabled = true;
+
+      try {
+        const resp = await fetch(`${BASE_URL}/api/export_dual_pdf`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            file_id: currentFileId,
+            direction: direction
+          })
+        });
+        if (!resp.ok) {
+          const errData = await resp.json();
+          throw new Error(errData.detail || `请求失败 ${resp.status}`);
+        }
+        const data = await resp.json();
+        if (data.ok && data.dual_pdf_url) {
+          setStatus(`对照 PDF 生成成功！`);
+          // 在新标签页中打开 PDF
+          window.open(`${BASE_URL}${data.dual_pdf_url}`, '_blank');
+        } else {
+          throw new Error('后端返回了成功状态，但没有 PDF URL。');
+        }
+      } catch (err) {
+        console.error(err);
+        setStatus(`生成对照 PDF 时出错：${err.message}`);
+      } finally {
+        exportPdfBtn.disabled = false;
+        layoutBtn.disabled = false;
+        if (jsonBox.value) {
+          translateBtn.disabled = false;
+          exportSinglePagePdfBtn.disabled = false;
+        }
+      }
+    });
+
+    // 生成对照 PDF (当前页)
+    exportSinglePagePdfBtn.addEventListener('click', async () => {
+      if (!currentFileId) {
+        setStatus('请先上传一个 PDF 文件。');
+        return;
+      }
+      let layoutObj;
+      try {
+        layoutObj = JSON.parse(jsonBox.value);
+      } catch (err) {
+        setStatus('当前页没有有效的 JSON 数据，请先生成或翻译。');
+        return;
+      }
+
+      const direction = getDirection();
+      const page = Number(pageSelect.value || 1);
+      setStatus(`正在为第 ${page} 页生成对照 PDF...`);
+      
+      // Disable buttons
+      exportPdfBtn.disabled = true;
+      exportSinglePagePdfBtn.disabled = true;
+      layoutBtn.disabled = true;
+      translateBtn.disabled = true;
+
+      try {
+        const resp = await fetch(`${BASE_URL}/api/export_single_page_pdf`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            file_id: currentFileId,
+            page: page,
+            direction: direction,
+            layout: layoutObj
+          })
+        });
+        if (!resp.ok) {
+          const errData = await resp.json();
+          throw new Error(errData.detail || `请求失败 ${resp.status}`);
+        }
+        const data = await resp.json();
+        if (data.ok && data.dual_pdf_url) {
+          setStatus(`第 ${page} 页对照 PDF 生成成功！`);
+          window.open(`${BASE_URL}${data.dual_pdf_url}`, '_blank');
+        } else {
+          throw new Error('后端返回了成功状态，但没有 PDF URL。');
+        }
+      } catch (err) {
+        console.error(err);
+        setStatus(`生成单页对照 PDF 时出错：${err.message}`);
+      } finally {
+        // Re-enable buttons
+        exportPdfBtn.disabled = false;
+        exportSinglePagePdfBtn.disabled = false;
+        layoutBtn.disabled = false;
+        translateBtn.disabled = false;
+      }
     });
 
     // 根据 layout 在指定容器里画方块
@@ -238,6 +350,7 @@
         renderLayout(data, layoutOriginal, false);
         setStatus(`第 ${page} 页布局 JSON 已生成，可编辑后再翻译。`);
         translateBtn.disabled = false;
+        exportSinglePagePdfBtn.disabled = false; // Enable single page export
       } catch (err) { console.error(err); setStatus('生成布局 JSON 时出错，请检查 /api/page_layout 日志。'); } finally { layoutBtn.disabled = false; }
     });
 
